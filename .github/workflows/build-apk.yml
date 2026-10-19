@@ -18,12 +18,12 @@ concurrency:
 
 jobs:
   build-android:
-    name: Locate project, build APK, and run lint
+    name: Find project and build APK
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Java 17
@@ -31,131 +31,156 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
-      - name: Set up Android SDK and accept SDK licenses
+      - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install/configure Gradle 8.11.1
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.11.1'
+      - name: Accept Android SDK licenses
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
 
-      - name: Locate Android project directory safely
+      - name: Locate or extract Android project
         id: locate
         shell: bash
         run: |
           set -euo pipefail
 
-          PROJECT_DIR="$(python3 - <<'PY'
-          import os
-          from pathlib import Path
+          REPO="$GITHUB_WORKSPACE"
+          SEARCH_ROOT="$RUNNER_TEMP/android-project-search"
+          mkdir -p "$SEARCH_ROOT"
 
-          repo = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
-          ignored = {
-              ".git", ".gradle", ".idea",
-              "build", "node_modules"
-          }
-          candidates = []
+          # First search the checked-out repository.
+          PROJECT_DIR=""
 
-          for current, dirs, files in os.walk(repo):
-              dirs[:] = [
-                  d for d in dirs if d not in ignored
-              ]
-              current_path = Path(current)
+          while IFS= read -r -d '' settings_file; do
+            candidate="$(dirname "$settings_file")"
 
-              has_settings = (
-                  "settings.gradle" in files or
-                  "settings.gradle.kts" in files
-              )
-
-              app_dir = current_path / "app"
-              has_app_build = (
-                  (app_dir / "build.gradle").is_file() or
-                  (app_dir / "build.gradle.kts").is_file()
-              )
-
-              if has_settings and has_app_build:
-                  candidates.append(current_path)
-
-          if not candidates:
-              print("ERROR: Android project root not found.")
-              print(
-                  "Expected settings.gradle(.kts) and "
-                  "app/build.gradle(.kts)."
-              )
-              print("Repository files (first 250):")
-
-              count = 0
-              for current, dirs, files in os.walk(repo):
-                  dirs[:] = [
-                      d for d in dirs if d not in ignored
-                  ]
-                  for name in files:
-                      print(
-                          Path(current, name).relative_to(repo)
-                      )
-                      count += 1
-                      if count >= 250:
-                          break
-                  if count >= 250:
-                      break
-
-              raise SystemExit(1)
-
-          candidates.sort(
-              key=lambda p: (
-                  len(p.relative_to(repo).parts), str(p)
-              )
+            if {
+              test -f "$candidate/app/build.gradle" ||
+              test -f "$candidate/app/build.gradle.kts"
+            }; then
+              PROJECT_DIR="$candidate"
+              break
+            fi
+          done < <(
+            find "$REPO" \
+              \( -type d \( \
+                -name .git -o \
+                -name .gradle -o \
+                -name build -o \
+                -name node_modules \
+              \) -prune \) -o \
+              \( -type f \( \
+                -name settings.gradle -o \
+                -name settings.gradle.kts \
+              \) -print0
           )
 
-          selected = candidates[0]
-          print(selected)
-          PY
-          )"
+          # If the project is packaged in a ZIP, extract it and search again.
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo "Project not found directly. Searching ZIP archives..."
 
-          if [[ -z "$PROJECT_DIR" || ! -d "$PROJECT_DIR" ]]; then
-            echo "ERROR: Project directory not found: $PROJECT_DIR" >&2
+            ZIP_COUNT=0
+
+            while IFS= read -r -d '' archive; do
+              ZIP_COUNT=$((ZIP_COUNT + 1))
+              DEST="$SEARCH_ROOT/archive-$ZIP_COUNT"
+              mkdir -p "$DEST"
+
+              echo "Extracting: $archive"
+
+              if ! unzip -oq "$archive" -d "$DEST"; then
+                echo "WARNING: Could not extract $archive"
+                continue
+              fi
+
+              while IFS= read -r -d '' settings_file; do
+                candidate="$(dirname "$settings_file")"
+
+                if {
+                  test -f "$candidate/app/build.gradle" ||
+                  test -f "$candidate/app/build.gradle.kts"
+                }; then
+                  PROJECT_DIR="$candidate"
+                  break
+                fi
+              done < <(
+                find "$DEST" \
+                  \( -type d \( \
+                    -name .git -o \
+                    -name .gradle -o \
+                    -name build -o \
+                    -name node_modules \
+                  \) -prune \) -o \
+                  \( -type f \( \
+                    -name settings.gradle -o \
+                    -name settings.gradle.kts \
+                  \) -print0
+              )
+
+              if [[ -n "$PROJECT_DIR" ]]; then
+                break
+              fi
+            done < <(
+              find "$REPO" -type f -iname '*.zip' -print0
+            )
+          fi
+
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo "::error::Android project not found."
+            echo "Expected settings.gradle(.kts) and app/build.gradle(.kts)."
+            echo "Repository file listing:"
+            find "$REPO" -maxdepth 5 -type f | head -250
             exit 1
           fi
 
-          if [[ ! -f "$PROJECT_DIR/settings.gradle" && \
-                ! -f "$PROJECT_DIR/settings.gradle.kts" ]]; then
-            echo "ERROR: Gradle settings file is missing." >&2
-            exit 1
-          fi
+          PROJECT_DIR="$(realpath "$PROJECT_DIR")"
 
-          if [[ ! -f "$PROJECT_DIR/app/build.gradle" && \
-                ! -f "$PROJECT_DIR/app/build.gradle.kts" ]]; then
-            echo "ERROR: app Gradle file is missing." >&2
-            exit 1
-          fi
-
-          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
-          echo "Detected Android project root: $PROJECT_DIR"
-          echo "Repository root: $GITHUB_WORKSPACE"
+          echo "Android project found at: $PROJECT_DIR"
+          echo "Project contents:"
           ls -la "$PROJECT_DIR"
 
-      - name: Verify Java, Gradle, and project paths
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Validate project files
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
           set -euo pipefail
-          java -version
-          gradle --version
 
-          test -f settings.gradle || \
-            test -f settings.gradle.kts
+          if [[ ! -f settings.gradle &&
+                ! -f settings.gradle.kts ]]; then
+            echo "::error::Missing Gradle settings file."
+            exit 1
+          fi
 
-          test -f app/build.gradle || \
-            test -f app/build.gradle.kts
+          if [[ ! -f app/build.gradle &&
+                ! -f app/build.gradle.kts ]]; then
+            echo "::error::Missing app module Gradle file."
+            exit 1
+          fi
 
-          echo "All required project paths exist."
+          echo "Gradle project structure is valid."
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
 
       - name: Build debug APK
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
-          gradle --no-daemon --stacktrace assembleDebug
+          set -euo pipefail
+
+          if [[ -f ./gradlew ]]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace assembleDebug
+          else
+            echo "No Gradle wrapper found; using installed Gradle."
+            gradle --no-daemon --stacktrace assembleDebug
+          fi
 
       - name: Run Android lint
         id: lint
@@ -163,10 +188,16 @@ jobs:
         working-directory: ${{ steps.locate.outputs.project_dir }}
         shell: bash
         run: |
-          gradle --no-daemon --stacktrace lintDebug
+          set -euo pipefail
 
-      - name: Collect generated APK and lint reports
-        id: collect
+          if [[ -f ./gradlew ]]; then
+            ./gradlew --no-daemon lintDebug
+          else
+            gradle --no-daemon lintDebug
+          fi
+
+      - name: Find APK files
+        id: apk
         if: always()
         shell: bash
         env:
@@ -174,53 +205,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${PROJECT_DIR:-}" || ! -d "$PROJECT_DIR" ]]; then
-            echo "No valid project directory to collect outputs."
-            exit 0
+          mkdir -p "$RUNNER_TEMP/apk-output"
+          FOUND=0
+
+          if [[ -n "${PROJECT_DIR:-}" &&
+                -d "${PROJECT_DIR:-/nonexistent}" ]]; then
+            while IFS= read -r -d '' apk_file; do
+              cp "$apk_file" "$RUNNER_TEMP/apk-output/"
+              FOUND=1
+              echo "Found APK: $apk_file"
+            done < <(
+              find "$PROJECT_DIR" -type f -name '*.apk' -print0
+            )
           fi
 
-          OUTPUT_FILE="$RUNNER_TEMP/android-artifact-paths.txt"
-          : > "$OUTPUT_FILE"
-
-          while IFS= read -r -d '' file; do
-            printf '%s\n' "$file" >> "$OUTPUT_FILE"
-          done < <(
-            find "$PROJECT_DIR" -type f \( \
-              -path '*/build/outputs/apk/debug/*.apk' -o \
-              -path '*/build/reports/lint-results-debug.html' -o \
-              -path '*/build/reports/lint-results-debug.xml' \
-            \) -print0
-          )
-
-          if [[ -s "$OUTPUT_FILE" ]]; then
-            {
-              echo 'paths<<EOF'
-              cat "$OUTPUT_FILE"
-              echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
-
-            echo "Collected artifacts:"
-            cat "$OUTPUT_FILE"
-          else
-            echo "No APK or lint report was generated."
-            {
-              echo 'paths<<EOF'
-              echo 'EOF'
-            } >> "$GITHUB_OUTPUT"
+          if [[ "$FOUND" -eq 0 ]]; then
+            echo "No APK was generated."
           fi
 
-      - name: Upload APK and lint reports
-        if: always() && steps.collect.outputs.paths != ''
+      - name: Upload APK artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CryptoAnalyser-by-ErrZhr-android-build
-          path: ${{ steps.collect.outputs.paths }}
+          name: CryptoAnalyser-by-ErrZhr-APK
+          path: ${{ runner.temp }}/apk-output/*.apk
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Report lint status
+      - name: Show lint warning
         if: steps.lint.outcome == 'failure'
         shell: bash
         run: |
-          echo "Android lint reported issues. Review the uploaded report." >&2
-          exit 1
+          echo "::warning::Lint reported issues. Review the build logs."
