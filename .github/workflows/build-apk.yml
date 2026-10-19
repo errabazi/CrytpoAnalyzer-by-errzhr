@@ -153,6 +153,7 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
+          gradle-version: '8.11.1'
           cache-disabled: true
 
       - name: Build debug APK
@@ -165,17 +166,17 @@ jobs:
             chmod +x ./gradlew
             ./gradlew --no-daemon --stacktrace assembleDebug
           else
-            echo "::error::Gradle wrapper (gradlew) is missing."
-            echo "Add the project's Gradle wrapper before building."
-            exit 1
+            echo "Gradle wrapper not found."
+            echo "Using installed Gradle 8.11.1..."
+            gradle --version
+            gradle --no-daemon --stacktrace assembleDebug
           fi
 
       - name: Find APK files
-        id: apk
         if: always()
-        shell: bash
         env:
           PROJECT_DIR: ${{ steps.locate.outputs.project_dir }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -207,4 +208,3 @@ jobs:
           path: ${{ runner.temp }}/apk-output/*.apk
           if-no-files-found: warn
           retention-days: 14
-
